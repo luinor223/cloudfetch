@@ -31,8 +31,6 @@ var (
 	reV1Delay       = regexp.MustCompile(`},\s*(\d{4,5})\)`)
 	reCfChlOpt      = regexp.MustCompile(`(?s)window\._cf_chl_opt\s*=\s*\{([^}]+)\}`)
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
-	reV2FormAction  = regexp.MustCompile(`<form[^>]*id="challenge-form"[^>]*action="([^"]*)"`)
-	reV2R           = regexp.MustCompile(`name="r"\s+value="([^"]*)"`)
 )
 
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
@@ -187,7 +185,7 @@ func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
 
 	// Try form action first, fall back to challenge-platform URL.
 	var submitURL string
-	if m := reV2FormAction.FindStringSubmatch(body); m != nil {
+	if m := reV1Form.FindStringSubmatch(body); m != nil {
 		u, err := origURL.Parse(m[1])
 		if err == nil {
 			submitURL = u.String()
@@ -199,7 +197,7 @@ func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
 	}
 
 	params := url.Values{}
-	if m := reV2R.FindStringSubmatch(body); m != nil {
+	if m := reV1R.FindStringSubmatch(body); m != nil {
 		params.Set("r", m[1])
 	}
 	params.Set("cf_ch_verify", "plat")

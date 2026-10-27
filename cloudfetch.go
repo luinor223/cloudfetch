@@ -33,6 +33,23 @@ var (
 	Edge    = utls.HelloEdge_Auto
 )
 
+var defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+var defaultHeaders = [][2]string{
+	{"sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`},
+	{"sec-ch-ua-mobile", "?0"},
+	{"sec-ch-ua-platform", `"Windows"`},
+	{"Upgrade-Insecure-Requests", "1"},
+	{"User-Agent", defaultUA},
+	{"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
+	{"Sec-Fetch-Site", "none"},
+	{"Sec-Fetch-Mode", "navigate"},
+	{"Sec-Fetch-User", "?1"},
+	{"Sec-Fetch-Dest", "document"},
+	{"Accept-Encoding", "gzip, deflate, br"},
+	{"Accept-Language", "en-US,en;q=0.9"},
+}
+
 // Option configures a Client.
 type Option func(*Client)
 
@@ -144,8 +161,6 @@ func (t *utlsTransport) getH2Conn(addr string, tlsConn net.Conn) (*http2.ClientC
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			return t.dialUTLS(ctx, network, addr)
 		},
-		AllowHTTP:          false,
-		DisableCompression: false,
 	}
 
 	cc, err := h2t.NewClientConn(tlsConn) //nolint:staticcheck
@@ -157,10 +172,23 @@ func (t *utlsTransport) getH2Conn(addr string, tlsConn net.Conn) (*http2.ClientC
 	return cc, nil
 }
 
+func (t *utlsTransport) cachedH2(addr string) *http2.ClientConn { //nolint:staticcheck
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cc, ok := t.h2Conns[addr]; ok && cc.CanTakeNewRequest() {
+		return cc
+	}
+	return nil
+}
+
 func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	addr := req.URL.Host
 	if !strings.Contains(addr, ":") {
 		addr += ":443"
+	}
+
+	if cc := t.cachedH2(addr); cc != nil {
+		return cc.RoundTrip(req)
 	}
 
 	tlsConn, err := t.dialUTLS(req.Context(), "tcp", addr)
@@ -168,9 +196,7 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	alpn := tlsConn.ConnectionState().NegotiatedProtocol
-
-	if alpn == "h2" {
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cc, err := t.getH2Conn(addr, tlsConn)
 		if err != nil {
 			tlsConn.Close()
@@ -179,34 +205,20 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return cc.RoundTrip(req)
 	}
 
-	// HTTP/1.1 fallback.
+	// HTTP/1.1 fallback: wrap the pre-dialed conn in a one-shot transport.
 	h1 := &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return tlsConn, nil
 		},
+		DisableKeepAlives: true,
 	}
-	return h1.RoundTrip(req)
+	resp, err := h1.RoundTrip(req)
+	h1.CloseIdleConnections()
+	return resp, err
 }
 
 func (c *Client) setHeaders(req *http.Request) {
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-	headers := [][2]string{
-		{"sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`},
-		{"sec-ch-ua-mobile", "?0"},
-		{"sec-ch-ua-platform", `"Windows"`},
-		{"Upgrade-Insecure-Requests", "1"},
-		{"User-Agent", ua},
-		{"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
-		{"Sec-Fetch-Site", "none"},
-		{"Sec-Fetch-Mode", "navigate"},
-		{"Sec-Fetch-User", "?1"},
-		{"Sec-Fetch-Dest", "document"},
-		{"Accept-Encoding", "gzip, deflate, br"},
-		{"Accept-Language", "en-US,en;q=0.9"},
-	}
-
-	for _, h := range headers {
+	for _, h := range defaultHeaders {
 		if req.Header.Get(h[0]) == "" {
 			req.Header.Set(h[0], h[1])
 		}
@@ -227,6 +239,7 @@ func (r *Response) decode() ([]byte, error) {
 	if r.body != nil {
 		return r.body, nil
 	}
+	defer r.Response.Body.Close()
 
 	var reader io.Reader = r.Response.Body
 	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
@@ -248,7 +261,6 @@ func (r *Response) decode() ([]byte, error) {
 		return nil, err
 	}
 	r.body = b
-	r.Response.Body.Close()
 	return r.body, nil
 }
 
@@ -284,7 +296,7 @@ var MaxChallengeRetries = 3
 func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 	c.init()
 
-	for attempt := range MaxChallengeRetries {
+	for attempt := range MaxChallengeRetries + 1 {
 		req, err := http.NewRequest(method, rawURL, body)
 		if err != nil {
 			return nil, err
@@ -298,7 +310,11 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 
 		wrapped := &Response{Response: resp}
 
-		if resp.StatusCode != 503 && resp.StatusCode != 403 {
+		if resp.StatusCode != 503 && resp.StatusCode != 403 && resp.StatusCode != 429 {
+			return wrapped, nil
+		}
+
+		if attempt == MaxChallengeRetries {
 			return wrapped, nil
 		}
 
@@ -333,18 +349,7 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 		}
 	}
 
-	// Final retry after challenge solved.
-	req, err := http.NewRequest(method, rawURL, body)
-	if err != nil {
-		return nil, err
-	}
-	c.setHeaders(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	return &Response{Response: resp}, nil
+	return nil, fmt.Errorf("challenge solve failed after %d attempts", MaxChallengeRetries)
 }
 
 // Cookies returns the cookies stored for the given URL.
