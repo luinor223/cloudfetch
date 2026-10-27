@@ -1,0 +1,310 @@
+// Package cloudfetch provides an HTTP client that bypasses Cloudflare bot
+// detection by mimicking a real Chrome browser's TLS fingerprint and headers.
+//
+// It uses uTLS to reproduce Chrome's TLS Client Hello (JA3 fingerprint),
+// sends browser-order headers, and maintains a cookie jar across requests.
+package cloudfetch
+
+import (
+	"compress/flate"
+	"compress/gzip"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/andybalholm/brotli"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
+)
+
+// ClientHelloID aliases for convenience.
+var (
+	Chrome  = utls.HelloChrome_Auto
+	Firefox = utls.HelloFirefox_Auto
+	Safari  = utls.HelloSafari_Auto
+	Edge    = utls.HelloEdge_Auto
+)
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithBrowser sets the TLS fingerprint to impersonate. Defaults to Chrome.
+func WithBrowser(id utls.ClientHelloID) Option {
+	return func(c *Client) { c.helloID = id }
+}
+
+// WithTimeout sets the HTTP client timeout. Defaults to 30s.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) { c.timeout = d }
+}
+
+// WithProxy sets an HTTP/HTTPS proxy URL.
+func WithProxy(proxyURL string) Option {
+	return func(c *Client) { c.proxyURL = proxyURL }
+}
+
+// WithHeader adds a default header sent with every request.
+func WithHeader(key, value string) Option {
+	return func(c *Client) { c.extraHeaders[key] = value }
+}
+
+// Client is an HTTP client with browser TLS fingerprinting.
+type Client struct {
+	helloID      utls.ClientHelloID
+	timeout      time.Duration
+	proxyURL     string
+	extraHeaders map[string]string
+	jar          http.CookieJar
+	httpClient   *http.Client
+	once         sync.Once
+}
+
+// New creates a new Client with the given options.
+func New(opts ...Option) *Client {
+	c := &Client{
+		helloID:      Chrome,
+		timeout:      30 * time.Second,
+		extraHeaders: make(map[string]string),
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+func (c *Client) init() {
+	c.once.Do(func() {
+		jar, _ := cookiejar.New(nil)
+		c.jar = jar
+
+		c.httpClient = &http.Client{
+			Jar:       jar,
+			Timeout:   c.timeout,
+			Transport: &utlsTransport{client: c},
+		}
+	})
+}
+
+// utlsTransport dials with uTLS and dispatches to h1 or h2 based on ALPN.
+type utlsTransport struct {
+	client *Client
+
+	mu      sync.Mutex
+	h2Conns map[string]*http2.ClientConn //nolint:staticcheck
+}
+
+func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*utls.UConn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConn := utls.UClient(conn, &utls.Config{
+		ServerName: host,
+	}, t.client.helloID)
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("utls handshake: %w", err)
+	}
+
+	return tlsConn, nil
+}
+
+func (t *utlsTransport) getH2Conn(addr string, tlsConn net.Conn) (*http2.ClientConn, error) { //nolint:staticcheck
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.h2Conns == nil {
+		t.h2Conns = make(map[string]*http2.ClientConn) //nolint:staticcheck
+	}
+
+	if cc, ok := t.h2Conns[addr]; ok {
+		if cc.CanTakeNewRequest() {
+			return cc, nil
+		}
+		delete(t.h2Conns, addr)
+	}
+
+	h2t := &http2.Transport{ //nolint:staticcheck
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return t.dialUTLS(ctx, network, addr)
+		},
+		AllowHTTP:          false,
+		DisableCompression: false,
+	}
+
+	cc, err := h2t.NewClientConn(tlsConn) //nolint:staticcheck
+	if err != nil {
+		return nil, err
+	}
+
+	t.h2Conns[addr] = cc
+	return cc, nil
+}
+
+func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	addr := req.URL.Host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+
+	tlsConn, err := t.dialUTLS(req.Context(), "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	alpn := tlsConn.ConnectionState().NegotiatedProtocol
+
+	if alpn == "h2" {
+		cc, err := t.getH2Conn(addr, tlsConn)
+		if err != nil {
+			tlsConn.Close()
+			return nil, fmt.Errorf("h2 client conn: %w", err)
+		}
+		return cc.RoundTrip(req)
+	}
+
+	// HTTP/1.1 fallback.
+	h1 := &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return tlsConn, nil
+		},
+	}
+	return h1.RoundTrip(req)
+}
+
+func (c *Client) setHeaders(req *http.Request) {
+	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+	headers := [][2]string{
+		{"sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`},
+		{"sec-ch-ua-mobile", "?0"},
+		{"sec-ch-ua-platform", `"Windows"`},
+		{"Upgrade-Insecure-Requests", "1"},
+		{"User-Agent", ua},
+		{"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
+		{"Sec-Fetch-Site", "none"},
+		{"Sec-Fetch-Mode", "navigate"},
+		{"Sec-Fetch-User", "?1"},
+		{"Sec-Fetch-Dest", "document"},
+		{"Accept-Encoding", "gzip, deflate, br"},
+		{"Accept-Language", "en-US,en;q=0.9"},
+	}
+
+	for _, h := range headers {
+		if req.Header.Get(h[0]) == "" {
+			req.Header.Set(h[0], h[1])
+		}
+	}
+
+	for k, v := range c.extraHeaders {
+		req.Header.Set(k, v)
+	}
+}
+
+// Response wraps http.Response with convenience methods.
+type Response struct {
+	*http.Response
+	body []byte
+}
+
+func (r *Response) decode() ([]byte, error) {
+	if r.body != nil {
+		return r.body, nil
+	}
+
+	var reader io.Reader = r.Response.Body
+	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
+	case "br":
+		reader = brotli.NewReader(r.Response.Body)
+	case "gzip":
+		gz, err := gzip.NewReader(r.Response.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gz.Close()
+		reader = gz
+	case "deflate":
+		reader = flate.NewReader(r.Response.Body)
+	}
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	r.body = b
+	r.Response.Body.Close()
+	return r.body, nil
+}
+
+// Text returns the response body as a string, decompressing if needed.
+func (r *Response) Text() (string, error) {
+	b, err := r.decode()
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// Bytes returns the response body as bytes, decompressing if needed.
+func (r *Response) Bytes() ([]byte, error) {
+	return r.decode()
+}
+
+// Get performs an HTTP GET request.
+func (c *Client) Get(rawURL string) (*Response, error) {
+	return c.Do("GET", rawURL, nil)
+}
+
+// Post performs an HTTP POST request.
+func (c *Client) Post(rawURL string, body io.Reader) (*Response, error) {
+	return c.Do("POST", rawURL, body)
+}
+
+// Do performs an HTTP request with the given method.
+func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
+	c.init()
+
+	req, err := http.NewRequest(method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	c.setHeaders(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return &Response{Response: resp}, nil
+}
+
+// Cookies returns the cookies stored for the given URL.
+func (c *Client) Cookies(rawURL string) []*http.Cookie {
+	c.init()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	return c.jar.Cookies(u)
+}
+
+// Underlying returns the raw *http.Client for advanced use.
+func (c *Client) Underlying() *http.Client {
+	c.init()
+	return c.httpClient
+}
