@@ -276,10 +276,64 @@ func (c *Client) Post(rawURL string, body io.Reader) (*Response, error) {
 	return c.Do("POST", rawURL, body)
 }
 
+// MaxChallengeRetries is how many times to attempt solving a challenge.
+var MaxChallengeRetries = 3
+
 // Do performs an HTTP request with the given method.
+// If a Cloudflare challenge is detected, it attempts to solve it automatically.
 func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 	c.init()
 
+	for attempt := range MaxChallengeRetries {
+		req, err := http.NewRequest(method, rawURL, body)
+		if err != nil {
+			return nil, err
+		}
+		c.setHeaders(req)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		wrapped := &Response{Response: resp}
+
+		if resp.StatusCode != 503 && resp.StatusCode != 403 {
+			return wrapped, nil
+		}
+
+		text, err := wrapped.Text()
+		if err != nil {
+			return wrapped, nil
+		}
+
+		ct := detectChallenge(resp, text)
+		if ct == noChallenge {
+			return wrapped, nil
+		}
+
+		parsedURL, _ := url.Parse(rawURL)
+
+		switch ct {
+		case iuamChallenge:
+			err = c.solveIUAM(text, parsedURL)
+		case v2Challenge:
+			err = c.solveV2Challenge(text, parsedURL)
+		case managedChallenge:
+			return nil, fmt.Errorf("managed challenge (Turnstile) detected — requires a real browser")
+		case captchaChallenge:
+			return nil, fmt.Errorf("CAPTCHA challenge detected — requires external solving service")
+		}
+
+		if err != nil {
+			if attempt == MaxChallengeRetries-1 {
+				return nil, fmt.Errorf("challenge solve failed after %d attempts: %w", attempt+1, err)
+			}
+			continue
+		}
+	}
+
+	// Final retry after challenge solved.
 	req, err := http.NewRequest(method, rawURL, body)
 	if err != nil {
 		return nil, err
