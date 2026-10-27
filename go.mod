@@ -1,6 +1,6 @@
 module github.com/luinor223/cloudfetch
 
-go 1.26.3
+go 1.26.0
 
 require (
 	github.com/andybalholm/brotli v1.0.6
