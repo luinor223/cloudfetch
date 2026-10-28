@@ -1,8 +1,9 @@
 // Package cloudfetch provides an HTTP client that bypasses Cloudflare bot
-// detection by mimicking a real Chrome browser's TLS fingerprint and headers.
+// detection by mimicking a real browser's TLS fingerprint and headers.
 //
-// It uses uTLS to reproduce Chrome's TLS Client Hello (JA3 fingerprint),
-// sends browser-order headers, and maintains a cookie jar across requests.
+// It uses uTLS to reproduce a browser's TLS Client Hello (JA3/JA4
+// fingerprint), sends that browser's default headers, and maintains a cookie
+// jar across requests.
 package cloudfetch
 
 import (
@@ -22,39 +23,18 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
-// ClientHelloID aliases for convenience.
-var (
-	Chrome  = utls.HelloChrome_Auto
-	Firefox = utls.HelloFirefox_Auto
-	Safari  = utls.HelloSafari_Auto
-	Edge    = utls.HelloEdge_Auto
-)
-
-var defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-var defaultHeaders = [][2]string{
-	{"sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`},
-	{"sec-ch-ua-mobile", "?0"},
-	{"sec-ch-ua-platform", `"Windows"`},
-	{"Upgrade-Insecure-Requests", "1"},
-	{"User-Agent", defaultUA},
-	{"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
-	{"Sec-Fetch-Site", "none"},
-	{"Sec-Fetch-Mode", "navigate"},
-	{"Sec-Fetch-User", "?1"},
-	{"Sec-Fetch-Dest", "document"},
-	{"Accept-Encoding", "gzip, deflate, br"},
-	{"Accept-Language", "en-US,en;q=0.9"},
-}
-
 // Option configures a Client.
 type Option func(*Client)
 
-// WithBrowser sets the TLS fingerprint to impersonate. Defaults to Chrome.
+// WithBrowser sets the browser to impersonate: its TLS fingerprint and its
+// default headers. Defaults to Chrome. For a utls ClientHelloID other than the
+// package presets, headers follow the preset for the same browser, so set
+// User-Agent with WithHeader if the version differs.
 func WithBrowser(id utls.ClientHelloID) Option {
 	return func(c *Client) { c.helloID = id }
 }
@@ -223,7 +203,7 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (c *Client) setHeaders(req *http.Request) {
-	for _, h := range defaultHeaders {
+	for _, h := range headersFor(c.helloID) {
 		if req.Header.Get(h[0]) == "" {
 			req.Header.Set(h[0], h[1])
 		}
@@ -259,6 +239,13 @@ func (r *Response) decode() ([]byte, error) {
 		reader = gz
 	case "deflate":
 		reader = flate.NewReader(r.Body)
+	case "zstd":
+		zr, err := zstd.NewReader(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		reader = zr
 	}
 
 	b, err := io.ReadAll(reader)

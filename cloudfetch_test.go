@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -69,6 +70,12 @@ func compress(t *testing.T, encoding string, data []byte) []byte {
 			t.Fatal(err)
 		}
 		w = fw
+	case "zstd":
+		zw, err := zstd.NewWriter(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w = zw
 	default:
 		return data
 	}
@@ -89,7 +96,7 @@ func hasCookie(r *http.Request, name string) bool {
 func TestResponseDecode(t *testing.T) {
 	want := strings.Repeat("hello cloudfetch ", 100)
 
-	for _, enc := range []string{"", "gzip", "br", "deflate", "GZIP"} {
+	for _, enc := range []string{"", "gzip", "br", "deflate", "zstd", "GZIP"} {
 		t.Run("encoding="+enc, func(t *testing.T) {
 			r, body := newTestResponse(enc, compress(t, strings.ToLower(enc), []byte(want)))
 
@@ -147,6 +154,39 @@ func TestSetHeaders(t *testing.T) {
 	}
 }
 
+func TestHeadersMatchBrowser(t *testing.T) {
+	tests := []struct {
+		id         utls.ClientHelloID
+		uaToken    string // ties the User-Agent to the uTLS preset's version
+		clientHint bool   // Chromium 89+ sends sec-ch-ua
+	}{
+		{Chrome, "Chrome/" + Chrome.Version + ".", true},
+		{Firefox, "Firefox/" + Firefox.Version + ".", false},
+		{Safari, "Version/" + Safari.Version + " ", false},
+		{Edge, "Edg/" + Edge.Version + ".", false},
+		{utls.HelloRandomized, "Chrome/" + Chrome.Version + ".", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id.Client, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+			New(WithBrowser(tt.id)).setHeaders(req)
+
+			if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, tt.uaToken) {
+				t.Errorf("User-Agent = %q, want it to contain %q", ua, tt.uaToken)
+			}
+			if got := req.Header.Get("sec-ch-ua") != ""; got != tt.clientHint {
+				t.Errorf("sec-ch-ua sent = %v, want %v", got, tt.clientHint)
+			}
+			for _, enc := range strings.Split(req.Header.Get("Accept-Encoding"), ", ") {
+				r, _ := newTestResponse(enc, compress(t, enc, []byte("ok")))
+				if text, err := r.Text(); err != nil || text != "ok" {
+					t.Errorf("advertised encoding %q not decoded: %q, %v", enc, text, err)
+				}
+			}
+		})
+	}
+}
+
 func TestDo_SendsHeaders(t *testing.T) {
 	var ua string
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -159,8 +199,8 @@ func TestDo_SendsHeaders(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if ua != defaultUA {
-		t.Errorf("User-Agent = %q, want %q", ua, defaultUA)
+	if !strings.Contains(ua, "Chrome/"+Chrome.Version+".") {
+		t.Errorf("User-Agent = %q, want Chrome %s", ua, Chrome.Version)
 	}
 }
 
