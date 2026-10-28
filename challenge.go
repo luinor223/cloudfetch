@@ -193,7 +193,9 @@ func evalV1Challenge(body, host string) (string, error) {
 	return answer.String(), nil
 }
 
-// solveV2Challenge solves the v2 challenge-platform challenge.
+// solveV2Challenge makes a best-effort attempt at the v2 challenge-platform
+// challenge by submitting its form fields. It does not run the challenge
+// script, so modern challenges usually fail.
 func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url.URL) error {
 	optsMatch := reCfChlOpt.FindStringSubmatch(body)
 	if optsMatch == nil {

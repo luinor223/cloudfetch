@@ -10,17 +10,22 @@ Go HTTP client that bypasses Cloudflare bot detection by mimicking a real browse
 
 ## How it works
 
-Cloudflare identifies bots partly by their TLS Client Hello fingerprint (JA3/JA4). Go's default `net/http` has a distinctive fingerprint that gets blocked. `cloudfetch` uses [uTLS](https://github.com/refraction-networking/utls) to reproduce Chrome's exact TLS handshake, plus browser-order HTTP headers and a cookie jar.
+Cloudflare identifies bots partly by their TLS Client Hello fingerprint (JA3/JA4). Go's default `net/http` has a distinctive fingerprint that gets blocked. `cloudfetch` uses [uTLS](https://github.com/refraction-networking/utls) to reproduce a real browser's TLS handshake, sends that browser's headers, and keeps a cookie jar.
 
-- **TLS fingerprint** — Chrome/Firefox/Safari/Edge via uTLS
-- **JS challenge solver** — automatically solves Cloudflare IUAM and v2 challenges using [goja](https://github.com/dop251/goja) (pure Go JS interpreter)
+- **TLS fingerprint** — Chrome 133, Firefox 120, Safari 16 or Edge 85 via uTLS
+- **Matching headers** — `User-Agent`, `Sec-CH-UA`, `Sec-Fetch-*`, etc. for the same browser and version as the TLS fingerprint
+- **JS challenge solver** — solves the classic IUAM ("Checking your browser") challenge using [goja](https://github.com/dop251/goja) (pure Go JS interpreter)
 - **Auto-retry** — detects challenge pages and retries after solving (up to 3 attempts)
 - **HTTP/2** — automatic ALPN negotiation and h2 support
-- **Browser headers** — correct `Sec-CH-UA`, `Sec-Fetch-*`, etc. in Chrome's order
-- **Compression** — transparent brotli/gzip/deflate decompression
+- **Compression** — transparent brotli/gzip/deflate/zstd decompression
 - **Cookie jar** — maintains cookies across requests
+- **Proxy** — HTTP CONNECT proxies, with optional basic auth
 
-> **Note:** Turnstile (managed challenges) and CAPTCHAs require a real browser and are not solvable by any HTTP-only client, including Python's cloudscraper.
+### Limitations
+
+- **Header order and HTTP/2 settings** come from Go's `net/http`, not the browser. Sites that fingerprint those can still tell `cloudfetch` apart from a real browser.
+- **Newer JS challenges** (`challenge-platform`) are detected, but the solver only submits the page's form fields without running its script, so they usually fail.
+- **Turnstile (managed challenges) and CAPTCHAs** need a real browser; no HTTP-only client can solve them.
 
 ## Install
 
@@ -67,8 +72,8 @@ client := cloudfetch.New(cloudfetch.WithBrowser(cloudfetch.Firefox))
 // makes extra requests; use DoContext with a deadline to bound the whole call.
 client := cloudfetch.New(cloudfetch.WithTimeout(60 * time.Second))
 
-// Proxy
-client := cloudfetch.New(cloudfetch.WithProxy("http://127.0.0.1:8080"))
+// HTTP proxy (CONNECT), optionally with basic auth
+client := cloudfetch.New(cloudfetch.WithProxy("http://user:pass@127.0.0.1:8080"))
 
 // Extra headers
 client := cloudfetch.New(cloudfetch.WithHeader("Referer", "https://google.com"))
