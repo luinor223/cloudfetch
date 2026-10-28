@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -226,8 +228,12 @@ func TestDo_UnsolvableChallenges(t *testing.T) {
 
 func TestDo_SolvesIUAM(t *testing.T) {
 	var slept time.Duration
-	sleep = func(d time.Duration) { slept = d }
-	t.Cleanup(func() { sleep = time.Sleep })
+	realWait := wait
+	wait = func(_ context.Context, d time.Duration) error {
+		slept = d
+		return nil
+	}
+	t.Cleanup(func() { wait = realWait })
 
 	var form url.Values
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +279,33 @@ func TestDo_SolvesIUAM(t *testing.T) {
 		if got := form.Get(k); got != want {
 			t.Errorf("form %s = %q, want %q", k, got, want)
 		}
+	}
+}
+
+func TestDoContext_CancelsChallengeWait(t *testing.T) {
+	var submitted bool
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			submitted = true
+		}
+		w.Header().Set("Server", "cloudflare")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, iuamPage) // asks for a 4s wait
+	}))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.DoContext(ctx, http.MethodGet, srv.URL, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("DoContext returned after %v, want it to stop at the deadline", elapsed)
+	}
+	if submitted {
+		t.Error("challenge answer was submitted after the deadline")
 	}
 }
 

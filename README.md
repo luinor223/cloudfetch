@@ -57,7 +57,8 @@ func main() {
 // Firefox fingerprint instead of Chrome
 client := cloudfetch.New(cloudfetch.WithBrowser(cloudfetch.Firefox))
 
-// Custom timeout
+// Custom per-request timeout. Solving a challenge waits several seconds and
+// makes extra requests; use DoContext with a deadline to bound the whole call.
 client := cloudfetch.New(cloudfetch.WithTimeout(60 * time.Second))
 
 // Proxy
@@ -73,6 +74,7 @@ client := cloudfetch.New(cloudfetch.WithHeader("Referer", "https://google.com"))
 resp, err := client.Get(url)
 resp, err := client.Post(url, body)
 resp, err := client.Do(method, url, body)
+resp, err := client.DoContext(ctx, method, url, body)  // cancellable, incl. challenge waits
 
 text, err := resp.Text()   // string, auto-decompressed
 bytes, err := resp.Bytes()  // []byte, auto-decompressed

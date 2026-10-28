@@ -299,10 +299,17 @@ var MaxChallengeRetries = 3
 // Do performs an HTTP request with the given method.
 // If a Cloudflare challenge is detected, it attempts to solve it automatically.
 func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
+	return c.DoContext(context.Background(), method, rawURL, body)
+}
+
+// DoContext is like Do but honors ctx for every request and for the waits
+// before submitting challenge answers. WithTimeout limits each HTTP request;
+// give ctx a deadline to bound the whole call, including challenge solving.
+func (c *Client) DoContext(ctx context.Context, method, rawURL string, body io.Reader) (*Response, error) {
 	c.init()
 
 	for attempt := range MaxChallengeRetries + 1 {
-		req, err := http.NewRequest(method, rawURL, body)
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 		if err != nil {
 			return nil, err
 		}
@@ -337,9 +344,9 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 
 		switch ct {
 		case iuamChallenge:
-			err = c.solveIUAM(text, parsedURL)
+			err = c.solveIUAM(ctx, text, parsedURL)
 		case v2Challenge:
-			err = c.solveV2Challenge(text, parsedURL)
+			err = c.solveV2Challenge(ctx, text, parsedURL)
 		case managedChallenge:
 			return nil, fmt.Errorf("managed challenge (Turnstile) detected — requires a real browser")
 		case captchaChallenge:
@@ -347,6 +354,9 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 		}
 
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
 			if attempt == MaxChallengeRetries-1 {
 				return nil, fmt.Errorf("challenge solve failed after %d attempts: %w", attempt+1, err)
 			}

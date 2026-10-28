@@ -109,10 +109,10 @@ func TestSolveV2Challenge_MissingOpts(t *testing.T) {
 	c := New()
 	u := &url.URL{Scheme: "https", Host: "example.com", Path: "/"}
 
-	if err := c.solveV2Challenge("<html></html>", u); err == nil {
+	if err := c.solveV2Challenge(t.Context(), "<html></html>", u); err == nil {
 		t.Error("expected error when cf_chl_opt is missing")
 	}
-	if err := c.solveV2Challenge(`window._cf_chl_opt={cType: 'managed'}`, u); err == nil {
+	if err := c.solveV2Challenge(t.Context(), `window._cf_chl_opt={cType: 'managed'}`, u); err == nil {
 		t.Error("expected error when cRay is missing")
 	}
 }

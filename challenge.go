@@ -1,6 +1,7 @@
 package cloudfetch
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -33,8 +34,18 @@ var (
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
 )
 
-// sleep waits before submitting a challenge answer; tests replace it.
-var sleep = time.Sleep
+// wait pauses before submitting a challenge answer, returning early with
+// ctx's error if it is done first. Tests replace it.
+var wait = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // isChallengeStatus reports whether a status code can carry a Cloudflare challenge.
 func isChallengeStatus(code int) bool {
@@ -82,7 +93,7 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 }
 
 // solveIUAM solves the v1 IUAM challenge (JSFuck arithmetic).
-func (c *Client) solveIUAM(body string, origURL *url.URL) error {
+func (c *Client) solveIUAM(ctx context.Context, body string, origURL *url.URL) error {
 	actionMatch := reV1Form.FindStringSubmatch(body)
 	if actionMatch == nil {
 		return fmt.Errorf("could not find challenge form")
@@ -117,9 +128,11 @@ func (c *Client) solveIUAM(body string, origURL *url.URL) error {
 			delay = d
 		}
 	}
-	sleep(delay)
+	if err := wait(ctx, delay); err != nil {
+		return err
+	}
 
-	req, err := http.NewRequest(http.MethodPost, submitURL.String(), strings.NewReader(params.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, submitURL.String(), strings.NewReader(params.Encode()))
 	if err != nil {
 		return err
 	}
@@ -181,7 +194,7 @@ func evalV1Challenge(body, host string) (string, error) {
 }
 
 // solveV2Challenge solves the v2 challenge-platform challenge.
-func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
+func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url.URL) error {
 	optsMatch := reCfChlOpt.FindStringSubmatch(body)
 	if optsMatch == nil {
 		return fmt.Errorf("could not find cf_chl_opt")
@@ -219,9 +232,11 @@ func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
 		params.Set("cf_ch_cp", h)
 	}
 
-	sleep(5 * time.Second)
+	if err := wait(ctx, 5*time.Second); err != nil {
+		return err
+	}
 
-	req, err := http.NewRequest(http.MethodPost, submitURL, strings.NewReader(params.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, submitURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return err
 	}
