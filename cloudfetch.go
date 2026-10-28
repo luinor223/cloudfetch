@@ -10,6 +10,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -82,6 +83,9 @@ type Client struct {
 	jar          http.CookieJar
 	httpClient   *http.Client
 	once         sync.Once
+
+	// rootCAs overrides the system roots for certificate verification (tests).
+	rootCAs *x509.CertPool
 }
 
 // New creates a new Client with the given options.
@@ -132,6 +136,7 @@ func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*ut
 
 	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName: host,
+		RootCAs:    t.client.rootCAs,
 	}, t.client.helloID)
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
