@@ -322,6 +322,37 @@ func TestDo_SolvesIUAM(t *testing.T) {
 	}
 }
 
+func TestDo_PostResendsBodyAfterChallenge(t *testing.T) {
+	realWait := wait
+	wait = func(context.Context, time.Duration) error { return nil }
+	t.Cleanup(func() { wait = realWait })
+
+	var bodies []string
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cdn-cgi/l/chk_jschl" {
+			http.SetCookie(w, &http.Cookie{Name: "cf_clearance", Value: "ok", Path: "/"})
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if !hasCookie(r, "cf_clearance") {
+			w.Header().Set("Server", "cloudflare")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, iuamPage)
+		}
+	}))
+
+	resp, err := c.Post(srv.URL, strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	resp.Body.Close()
+
+	if want := []string{"payload", "payload"}; !slices.Equal(bodies, want) {
+		t.Errorf("request bodies = %q, want %q", bodies, want)
+	}
+}
+
 func TestDoContext_CancelsChallengeWait(t *testing.T) {
 	var submitted bool
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

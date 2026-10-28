@@ -7,6 +7,7 @@
 package cloudfetch
 
 import (
+	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
@@ -295,8 +296,22 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 func (c *Client) DoContext(ctx context.Context, method, rawURL string, body io.Reader) (*Response, error) {
 	c.init()
 
+	// Buffer the body so it can be resent after solving a challenge.
+	var payload []byte
+	if body != nil {
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		payload = b
+	}
+
 	for attempt := range MaxChallengeRetries + 1 {
-		req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+		var reqBody io.Reader
+		if body != nil {
+			reqBody = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, reqBody)
 		if err != nil {
 			return nil, err
 		}
