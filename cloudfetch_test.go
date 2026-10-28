@@ -24,7 +24,6 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
-	utls "github.com/refraction-networking/utls"
 )
 
 // newTestClient returns a Client whose requests go to a local TLS test server
@@ -158,20 +157,19 @@ func TestSetHeaders(t *testing.T) {
 
 func TestHeadersMatchBrowser(t *testing.T) {
 	tests := []struct {
-		id         utls.ClientHelloID
-		uaToken    string // ties the User-Agent to the uTLS preset's version
+		browser    Browser
+		uaToken    string // ties the User-Agent to the TLS fingerprint's version
 		clientHint bool   // Chromium 89+ sends sec-ch-ua
 	}{
-		{Chrome, "Chrome/" + Chrome.Version + ".", true},
-		{Firefox, "Firefox/" + Firefox.Version + ".", false},
-		{Safari, "Version/" + Safari.Version + " ", false},
-		{Edge, "Edg/" + Edge.Version + ".", false},
-		{utls.HelloRandomized, "Chrome/" + Chrome.Version + ".", true},
+		{Chrome, "Chrome/" + Chrome.hello.Version + ".", true},
+		{Firefox, "Firefox/" + Firefox.hello.Version + ".", false},
+		{Safari, "Version/" + Safari.hello.Version + " ", false},
+		{Edge, "Edg/" + Edge.hello.Version + ".", false},
 	}
 	for _, tt := range tests {
-		t.Run(tt.id.Client, func(t *testing.T) {
+		t.Run(tt.browser.hello.Client, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-			New(WithBrowser(tt.id)).setHeaders(req)
+			New(WithBrowser(tt.browser)).setHeaders(req)
 
 			if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, tt.uaToken) {
 				t.Errorf("User-Agent = %q, want it to contain %q", ua, tt.uaToken)
@@ -201,8 +199,69 @@ func TestDo_SendsHeaders(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if !strings.Contains(ua, "Chrome/"+Chrome.Version+".") {
-		t.Errorf("User-Agent = %q, want Chrome %s", ua, Chrome.Version)
+	if !strings.Contains(ua, "Chrome/"+Chrome.hello.Version+".") {
+		t.Errorf("User-Agent = %q, want Chrome %s", ua, Chrome.hello.Version)
+	}
+}
+
+func TestDo_HeaderPrecedence(t *testing.T) {
+	var got http.Header
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}), WithHeader("X-Test", "client"), WithHeader("Accept-Language", "fr"))
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Test", "request")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	checks := map[string]string{
+		"X-Test":          "request", // request beats WithHeader
+		"Accept-Language": "fr",      // WithHeader beats the browser default
+		"Sec-Fetch-Mode":  "navigate",
+	}
+	for k, want := range checks {
+		if v := got.Get(k); v != want {
+			t.Errorf("%s = %q, want %q", k, v, want)
+		}
+	}
+	if len(req.Header) != 1 {
+		t.Errorf("Do modified the caller's request headers: %v", req.Header)
+	}
+}
+
+func TestDo_MaxRetries(t *testing.T) {
+	realWait := wait
+	wait = func(context.Context, time.Duration) error { return nil }
+	t.Cleanup(func() { wait = realWait })
+
+	for _, retries := range []int{0, 2} {
+		t.Run(strconv.Itoa(retries), func(t *testing.T) {
+			var submits atomic.Int32
+			c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					submits.Add(1)
+					return
+				}
+				w.Header().Set("Server", "cloudflare")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, iuamPage) // never accepts the answer
+			}), WithMaxRetries(retries))
+
+			if _, err := c.Get(srv.URL); !errors.Is(err, ErrChallengeFailed) {
+				t.Fatalf("err = %v, want ErrChallengeFailed", err)
+			}
+			if n := submits.Load(); n != int32(retries) {
+				t.Errorf("submitted %d answers, want %d", n, retries)
+			}
+		})
 	}
 }
 
@@ -253,16 +312,23 @@ func TestDo_ErrorStatusWithoutChallenge(t *testing.T) {
 }
 
 func TestDo_UnsolvableChallenges(t *testing.T) {
-	for name, body := range map[string]string{"managed": managedPage, "captcha": captchaPage} {
+	tests := map[string]struct {
+		body string
+		want error
+	}{
+		"managed": {managedPage, ErrManagedChallenge},
+		"captcha": {captchaPage, ErrCaptcha},
+	}
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Server", "cloudflare")
 				w.WriteHeader(http.StatusForbidden)
-				_, _ = io.WriteString(w, body)
+				_, _ = io.WriteString(w, tt.body)
 			}))
 
-			if _, err := c.Get(srv.URL); err == nil {
-				t.Fatal("expected error for unsolvable challenge")
+			if _, err := c.Get(srv.URL); !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
 			}
 		})
 	}
@@ -344,7 +410,7 @@ func TestDo_PostResendsBodyAfterChallenge(t *testing.T) {
 		}
 	}))
 
-	resp, err := c.Post(srv.URL, strings.NewReader("payload"))
+	resp, err := c.Post(srv.URL, "text/plain", strings.NewReader("payload"))
 	if err != nil {
 		t.Fatalf("Post: %v", err)
 	}
@@ -355,7 +421,7 @@ func TestDo_PostResendsBodyAfterChallenge(t *testing.T) {
 	}
 }
 
-func TestDoContext_CancelsChallengeWait(t *testing.T) {
+func TestDo_CancelsChallengeWait(t *testing.T) {
 	var submitted bool
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -369,13 +435,16 @@ func TestDoContext_CancelsChallengeWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	req.RequestURI = ""
+
 	start := time.Now()
-	_, err := c.DoContext(ctx, http.MethodGet, srv.URL, nil)
+	_, err := c.Do(req)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("DoContext returned after %v, want it to stop at the deadline", elapsed)
+		t.Errorf("Do returned after %v, want it to stop at the deadline", elapsed)
 	}
 	if submitted {
 		t.Error("challenge answer was submitted after the deadline")
@@ -401,7 +470,7 @@ func TestTransport_UTLS(t *testing.T) {
 	tests := []struct {
 		name       string
 		http2      bool
-		browser    utls.ClientHelloID
+		browser    Browser
 		wantProto  int
 		wantConns  int // TLS connections for two requests
 		wantGREASE bool
@@ -557,5 +626,34 @@ func TestTransport_ProxyErrors(t *testing.T) {
 				t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestClient_CloseIdleConnections(t *testing.T) {
+	c, srv := newUTLSTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), true)
+	var handshakes atomic.Int32
+	srv.TLS.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		handshakes.Add(1)
+		return nil, nil
+	}
+
+	get := func() {
+		t.Helper()
+		resp, err := c.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	get()
+	get()
+	if n := handshakes.Load(); n != 1 {
+		t.Fatalf("got %d handshakes before closing, want 1 (connection reused)", n)
+	}
+	c.CloseIdleConnections()
+	get()
+	if n := handshakes.Load(); n != 2 {
+		t.Errorf("got %d handshakes after closing, want 2 (new connection)", n)
 	}
 }

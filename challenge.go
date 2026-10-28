@@ -126,24 +126,21 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 		return noChallenge
 	}
 
-	// v2 managed / turnstile (not solvable).
 	if strings.Contains(body, "orchestrate/managed/v1") ||
 		strings.Contains(body, "cf-turnstile") {
 		return managedChallenge
 	}
 
-	// Captcha: v2 challenge-platform, or the older cf-captcha page.
+	// Newer challenge-platform page, or the older cf-captcha one.
 	if sc == 403 && (strings.Contains(body, "orchestrate/captcha/v1") ||
 		strings.Contains(body, "cf-captcha-container")) {
 		return captchaChallenge
 	}
 
-	// v2 JS challenge (challenge-platform).
 	if strings.Contains(body, "challenge-platform") && strings.Contains(body, "cf_chl_opt") {
 		return v2Challenge
 	}
 
-	// v1 IUAM.
 	if strings.Contains(body, "jschl_vc") || strings.Contains(body, "/cdn-cgi/images/trace/jsch/") {
 		return iuamChallenge
 	}
@@ -266,7 +263,6 @@ func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url
 		return fmt.Errorf("missing cRay")
 	}
 
-	// Try form action first, fall back to challenge-platform URL.
 	page := parseChallengePage(body)
 	var submitURL string
 	if page.action != "" {

@@ -68,14 +68,17 @@ func main() {
 // Firefox fingerprint instead of Chrome
 client := cloudfetch.New(cloudfetch.WithBrowser(cloudfetch.Firefox))
 
-// Custom per-request timeout. Solving a challenge waits several seconds and
-// makes extra requests; use DoContext with a deadline to bound the whole call.
+// Per-request timeout. To bound a whole call, including challenge solving,
+// give the request's context a deadline.
 client := cloudfetch.New(cloudfetch.WithTimeout(60 * time.Second))
+
+// Challenge solve attempts per request (default 3, 0 disables solving)
+client := cloudfetch.New(cloudfetch.WithMaxRetries(1))
 
 // HTTP proxy (CONNECT), optionally with basic auth
 client := cloudfetch.New(cloudfetch.WithProxy("http://user:pass@127.0.0.1:8080"))
 
-// Extra headers
+// Header for every request (request headers still take precedence)
 client := cloudfetch.New(cloudfetch.WithHeader("Referer", "https://google.com"))
 ```
 
@@ -83,15 +86,26 @@ client := cloudfetch.New(cloudfetch.WithHeader("Referer", "https://google.com"))
 
 ```go
 resp, err := client.Get(url)
-resp, err := client.Post(url, body)
-resp, err := client.Do(method, url, body)
-resp, err := client.DoContext(ctx, method, url, body)  // cancellable, incl. challenge waits
+resp, err := client.Post(url, "application/json", body)
+resp, err := client.Do(req)  // *http.Request: per-request headers, context
 
-text, err := resp.Text()   // string, auto-decompressed
+text, err := resp.Text()    // string, auto-decompressed
 bytes, err := resp.Bytes()  // []byte, auto-decompressed
 
 cookies := client.Cookies(url)
-httpClient := client.Underlying()  // *http.Client for advanced use
+client.CloseIdleConnections()
+httpClient := client.Underlying()  // raw *http.Client: fingerprint only, no headers or solving
+```
+
+### Errors
+
+```go
+resp, err := client.Get(url)
+switch {
+case errors.Is(err, cloudfetch.ErrManagedChallenge): // Turnstile: needs a real browser
+case errors.Is(err, cloudfetch.ErrCaptcha):          // CAPTCHA
+case errors.Is(err, cloudfetch.ErrChallengeFailed):  // JS challenge not solved after retries
+}
 ```
 
 ## License
