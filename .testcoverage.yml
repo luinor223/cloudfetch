@@ -2,4 +2,4 @@ profile: cover.out
 
 exclude:
   paths:
-    - ^example/
+    - ^examples/
