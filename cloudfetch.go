@@ -239,21 +239,21 @@ func (r *Response) decode() ([]byte, error) {
 	if r.body != nil {
 		return r.body, nil
 	}
-	defer r.Response.Body.Close()
+	defer r.Body.Close()
 
-	var reader io.Reader = r.Response.Body
+	var reader io.Reader = r.Body
 	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
 	case "br":
-		reader = brotli.NewReader(r.Response.Body)
+		reader = brotli.NewReader(r.Body)
 	case "gzip":
-		gz, err := gzip.NewReader(r.Response.Body)
+		gz, err := gzip.NewReader(r.Body)
 		if err != nil {
 			return nil, err
 		}
 		defer gz.Close()
 		reader = gz
 	case "deflate":
-		reader = flate.NewReader(r.Response.Body)
+		reader = flate.NewReader(r.Body)
 	}
 
 	b, err := io.ReadAll(reader)
@@ -303,14 +303,14 @@ func (c *Client) Do(method, rawURL string, body io.Reader) (*Response, error) {
 		}
 		c.setHeaders(req)
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := c.httpClient.Do(req) //nolint:bodyclose // closed by Response.decode or the caller
 		if err != nil {
 			return nil, err
 		}
 
 		wrapped := &Response{Response: resp}
 
-		if resp.StatusCode != 503 && resp.StatusCode != 403 && resp.StatusCode != 429 {
+		if !isChallengeStatus(resp.StatusCode) {
 			return wrapped, nil
 		}
 

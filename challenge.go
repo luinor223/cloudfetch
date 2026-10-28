@@ -15,11 +15,11 @@ import (
 type challengeType int
 
 const (
-	noChallenge challengeType = iota
-	iuamChallenge             // v1: classic IUAM "Checking your browser" with JSFuck arithmetic
-	v2Challenge               // v2: challenge-platform with cf_chl_opt
-	managedChallenge          // Turnstile / managed (not solvable without browser)
-	captchaChallenge          // hCaptcha / reCAPTCHA (needs external service)
+	noChallenge      challengeType = iota
+	iuamChallenge                  // v1: classic IUAM "Checking your browser" with JSFuck arithmetic
+	v2Challenge                    // v2: challenge-platform with cf_chl_opt
+	managedChallenge               // Turnstile / managed (not solvable without browser)
+	captchaChallenge               // hCaptcha / reCAPTCHA (needs external service)
 )
 
 var (
@@ -27,7 +27,7 @@ var (
 	reV1JschlVc     = regexp.MustCompile(`name="jschl_vc"\s+value="([^"]*)"`)
 	reV1Pass        = regexp.MustCompile(`name="pass"\s+value="([^"]*)"`)
 	reV1R           = regexp.MustCompile(`name="r"\s+value="([^"]*)"`)
-	reV1Script      = regexp.MustCompile(`(?s)setTimeout\(function\(\)\{\s*(var\s+s,t,o,p.*?a\.value\s*=.+?)\s*[;,]`, )
+	reV1Script      = regexp.MustCompile(`(?s)setTimeout\(function\(\)\{\s*(var\s+s,t,o,p.*?a\.value\s*=.+?)\s*[;,]`)
 	reV1Delay       = regexp.MustCompile(`},\s*(\d{4,5})\)`)
 	reCfChlOpt      = regexp.MustCompile(`(?s)window\._cf_chl_opt\s*=\s*\{([^}]+)\}`)
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
@@ -35,6 +35,15 @@ var (
 
 // sleep waits before submitting a challenge answer; tests replace it.
 var sleep = time.Sleep
+
+// isChallengeStatus reports whether a status code can carry a Cloudflare challenge.
+func isChallengeStatus(code int) bool {
+	switch code {
+	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
+	}
+	return false
+}
 
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
 func detectChallenge(resp *http.Response, body string) challengeType {
@@ -44,7 +53,7 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 	}
 
 	sc := resp.StatusCode
-	if sc != 403 && sc != 429 && sc != 503 {
+	if !isChallengeStatus(sc) {
 		return noChallenge
 	}
 
@@ -110,7 +119,7 @@ func (c *Client) solveIUAM(body string, origURL *url.URL) error {
 	}
 	sleep(delay)
 
-	req, err := http.NewRequest("POST", submitURL.String(), strings.NewReader(params.Encode()))
+	req, err := http.NewRequest(http.MethodPost, submitURL.String(), strings.NewReader(params.Encode()))
 	if err != nil {
 		return err
 	}
@@ -137,7 +146,7 @@ func evalV1Challenge(body, host string) (string, error) {
 	vm := goja.New()
 
 	// Minimal DOM stubs so the challenge JS can run.
-	vm.Set("document", map[string]any{
+	_ = vm.Set("document", map[string]any{
 		"createElement": func(tag string) map[string]any {
 			return map[string]any{
 				"firstChild": map[string]any{
@@ -212,7 +221,7 @@ func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
 
 	sleep(5 * time.Second)
 
-	req, err := http.NewRequest("POST", submitURL, strings.NewReader(params.Encode()))
+	req, err := http.NewRequest(http.MethodPost, submitURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return err
 	}
