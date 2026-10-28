@@ -33,6 +33,9 @@ var (
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
 )
 
+// sleep waits before submitting a challenge answer; tests replace it.
+var sleep = time.Sleep
+
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
 func detectChallenge(resp *http.Response, body string) challengeType {
 	server := resp.Header.Get("Server")
@@ -105,7 +108,7 @@ func (c *Client) solveIUAM(body string, origURL *url.URL) error {
 			delay = d
 		}
 	}
-	time.Sleep(delay)
+	sleep(delay)
 
 	req, err := http.NewRequest("POST", submitURL.String(), strings.NewReader(params.Encode()))
 	if err != nil {
@@ -207,7 +210,7 @@ func (c *Client) solveV2Challenge(body string, origURL *url.URL) error {
 		params.Set("cf_ch_cp", h)
 	}
 
-	time.Sleep(5 * time.Second)
+	sleep(5 * time.Second)
 
 	req, err := http.NewRequest("POST", submitURL, strings.NewReader(params.Encode()))
 	if err != nil {
