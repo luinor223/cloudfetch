@@ -7,12 +7,14 @@
 package cloudfetch
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -45,7 +47,9 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.timeout = d }
 }
 
-// WithProxy sets an HTTP/HTTPS proxy URL.
+// WithProxy routes connections through an HTTP proxy, given as
+// "http://[user:pass@]host:port", using CONNECT tunnels. The TLS handshake
+// with the target still happens end to end, so the fingerprint is unchanged.
 func WithProxy(proxyURL string) Option {
 	return func(c *Client) { c.proxyURL = proxyURL }
 }
@@ -109,8 +113,7 @@ func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*ut
 		host = addr
 	}
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, network, addr)
+	conn, err := t.dial(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +129,68 @@ func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*ut
 	}
 
 	return tlsConn, nil
+}
+
+// dial opens a TCP connection to addr, tunneling through the proxy if set.
+func (t *utlsTransport) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if t.client.proxyURL == "" {
+		return dialer.DialContext(ctx, network, addr)
+	}
+
+	proxy, err := url.Parse(t.client.proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	if proxy.Scheme != "http" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q: only http is supported", proxy.Scheme)
+	}
+	proxyAddr := proxy.Host
+	if proxy.Port() == "" {
+		proxyAddr = net.JoinHostPort(proxy.Hostname(), "80")
+	}
+
+	conn, err := dialer.DialContext(ctx, network, proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial proxy: %w", err)
+	}
+	if err := connectTunnel(ctx, conn, proxy, addr); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// connectTunnel asks the proxy on conn to open a tunnel to addr.
+func connectTunnel(ctx context.Context, conn net.Conn, proxy *url.URL, addr string) error {
+	// Unblock the CONNECT exchange if ctx ends first.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: addr},
+		Host:   addr,
+		Header: make(http.Header),
+	}
+	if u := proxy.User; u != nil {
+		pass, _ := u.Password()
+		creds := base64.StdEncoding.EncodeToString([]byte(u.Username() + ":" + pass))
+		req.Header.Set("Proxy-Authorization", "Basic "+creds)
+	}
+	if err := req.Write(conn); err != nil {
+		return fmt.Errorf("proxy CONNECT: %w", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return fmt.Errorf("proxy CONNECT: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("proxy CONNECT: %s", resp.Status)
+	}
+	return nil
 }
 
 func (t *utlsTransport) getH2Conn(addr string, tlsConn net.Conn) (*http2.ClientConn, error) { //nolint:staticcheck

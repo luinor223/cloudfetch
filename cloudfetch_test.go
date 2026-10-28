@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -471,5 +473,89 @@ func TestTransport_UntrustedCertificate(t *testing.T) {
 
 	if _, err := New().Get(srv.URL); err == nil {
 		t.Fatal("expected certificate verification error")
+	}
+}
+
+// newConnectProxy starts an HTTP CONNECT proxy that requires wantAuth as the
+// Proxy-Authorization header (if non-empty) and counts opened tunnels.
+func newConnectProxy(t *testing.T, wantAuth string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var tunnels atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		if wantAuth != "" && r.Header.Get("Proxy-Authorization") != wantAuth {
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+		target, err := net.Dial("tcp", r.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		client, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			target.Close()
+			return
+		}
+		tunnels.Add(1)
+		_, _ = io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n")
+		go func() {
+			_, _ = io.Copy(target, client)
+			target.Close()
+		}()
+		go func() {
+			_, _ = io.Copy(client, target)
+			client.Close()
+		}()
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &tunnels
+}
+
+func TestTransport_Proxy(t *testing.T) {
+	proxy, tunnels := newConnectProxy(t, "Basic dXNlcjpwYXNz") // user:pass
+	proxyURL := strings.Replace(proxy.URL, "http://", "http://user:pass@", 1)
+
+	c, srv := newUTLSTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}), true, WithProxy(proxyURL))
+
+	for range 2 {
+		resp, err := c.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if text, _ := resp.Text(); text != "ok" {
+			t.Errorf("body = %q, want %q", text, "ok")
+		}
+	}
+	if n := tunnels.Load(); n != 1 {
+		t.Errorf("proxy opened %d tunnels, want 1 (h2 connection reused)", n)
+	}
+}
+
+func TestTransport_ProxyErrors(t *testing.T) {
+	proxy, _ := newConnectProxy(t, "Basic dXNlcjpwYXNz")
+
+	tests := []struct {
+		name     string
+		proxyURL string
+		wantErr  string
+	}{
+		{"auth rejected", proxy.URL, "407 Proxy Authentication Required"},
+		{"unsupported scheme", "socks5://127.0.0.1:1080", `unsupported proxy scheme "socks5"`},
+		{"unreachable proxy", "http://127.0.0.1:1", "dial proxy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, srv := newUTLSTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), false, WithProxy(tt.proxyURL))
+			_, err := c.Get(srv.URL)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }
