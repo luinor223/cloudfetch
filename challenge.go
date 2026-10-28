@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
 // challengeType identifies which Cloudflare protection was triggered.
@@ -24,11 +26,7 @@ const (
 )
 
 var (
-	reV1Form        = regexp.MustCompile(`<form[^>]*id="challenge-form"[^>]*action="([^"]*)"`)
-	reV1JschlVc     = regexp.MustCompile(`name="jschl_vc"\s+value="([^"]*)"`)
-	reV1Pass        = regexp.MustCompile(`name="pass"\s+value="([^"]*)"`)
-	reV1R           = regexp.MustCompile(`name="r"\s+value="([^"]*)"`)
-	reV1Script      = regexp.MustCompile(`(?s)setTimeout\(function\(\)\{\s*(var\s+s,t,o,p.*?a\.value\s*=.+?)\s*[;,]`)
+	reV1Script      = regexp.MustCompile(`(?s)setTimeout\(function\(\)\{\s*(var\s+s,t,o,p.*?)(?:f\.action\s*\+=|\}\s*,\s*\d{4,5}\))`)
 	reV1Delay       = regexp.MustCompile(`},\s*(\d{4,5})\)`)
 	reCfChlOpt      = regexp.MustCompile(`(?s)window\._cf_chl_opt\s*=\s*\{([^}]+)\}`)
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
@@ -56,6 +54,66 @@ func isChallengeStatus(code int) bool {
 	return false
 }
 
+// challengePage is the parsed markup of a challenge page.
+type challengePage struct {
+	action string                // action of the challenge form, if any
+	inputs url.Values            // inputs inside the challenge form
+	byID   map[string]*html.Node // elements by id
+}
+
+// parseChallengePage parses a challenge page. Commented-out markup, which
+// challenge pages use to hide decoy inputs, is not part of the tree.
+func parseChallengePage(body string) *challengePage {
+	page := &challengePage{inputs: url.Values{}, byID: make(map[string]*html.Node)}
+	doc, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		return page
+	}
+	for n := range doc.Descendants() {
+		if n.Type != html.ElementNode {
+			continue
+		}
+		if id := attr(n, "id"); id != "" {
+			if _, ok := page.byID[id]; !ok {
+				page.byID[id] = n
+			}
+		}
+		if n.DataAtom == atom.Form && attr(n, "id") == "challenge-form" {
+			page.action = attr(n, "action")
+			for in := range n.Descendants() {
+				if in.DataAtom == atom.Input && attr(in, "name") != "" {
+					page.inputs.Add(attr(in, "name"), attr(in, "value"))
+				}
+			}
+		}
+	}
+	return page
+}
+
+// text returns the text content of the element with the given id.
+func (p *challengePage) text(id string) string {
+	n, ok := p.byID[id]
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for c := range n.Descendants() {
+		if c.Type == html.TextNode {
+			b.WriteString(c.Data)
+		}
+	}
+	return b.String()
+}
+
+func attr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
 func detectChallenge(resp *http.Response, body string) challengeType {
 	server := resp.Header.Get("Server")
@@ -74,8 +132,9 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 		return managedChallenge
 	}
 
-	// v2 captcha.
-	if sc == 403 && strings.Contains(body, "orchestrate/captcha/v1") {
+	// Captcha: v2 challenge-platform, or the older cf-captcha page.
+	if sc == 403 && (strings.Contains(body, "orchestrate/captcha/v1") ||
+		strings.Contains(body, "cf-captcha-container")) {
 		return captchaChallenge
 	}
 
@@ -94,31 +153,22 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 
 // solveIUAM solves the v1 IUAM challenge (JSFuck arithmetic).
 func (c *Client) solveIUAM(ctx context.Context, body string, origURL *url.URL) error {
-	actionMatch := reV1Form.FindStringSubmatch(body)
-	if actionMatch == nil {
+	page := parseChallengePage(body)
+	if page.action == "" {
 		return fmt.Errorf("could not find challenge form")
 	}
 
-	submitURL, err := origURL.Parse(actionMatch[1])
+	submitURL, err := origURL.Parse(page.action)
 	if err != nil {
 		return fmt.Errorf("invalid form action: %w", err)
 	}
 
-	params := url.Values{}
-	if m := reV1R.FindStringSubmatch(body); m != nil {
-		params.Set("r", m[1])
-	}
-	if m := reV1JschlVc.FindStringSubmatch(body); m != nil {
-		params.Set("jschl_vc", m[1])
-	}
-	if m := reV1Pass.FindStringSubmatch(body); m != nil {
-		params.Set("pass", m[1])
-	}
-
-	answer, err := evalV1Challenge(body, origURL.Host)
+	answer, err := evalV1Challenge(body, page, origURL.Host)
 	if err != nil {
 		return fmt.Errorf("JS eval: %w", err)
 	}
+	// Submit the form as a browser would: its inputs, with the answer filled in.
+	params := page.inputs
 	params.Set("jschl_answer", answer)
 
 	// CF expects a delay before submission (typically 4s).
@@ -148,8 +198,9 @@ func (c *Client) solveIUAM(ctx context.Context, body string, origURL *url.URL) e
 	return nil
 }
 
-// evalV1Challenge extracts and evaluates the IUAM JSFuck arithmetic.
-func evalV1Challenge(body, host string) (string, error) {
+// evalV1Challenge runs the IUAM challenge function up to the form submit
+// and returns the value it leaves in the answer input.
+func evalV1Challenge(body string, page *challengePage, host string) (string, error) {
 	scriptMatch := reV1Script.FindStringSubmatch(body)
 	if scriptMatch == nil {
 		return "", fmt.Errorf("could not extract challenge script")
@@ -158,7 +209,14 @@ func evalV1Challenge(body, host string) (string, error) {
 
 	vm := goja.New()
 
-	// Minimal DOM stubs so the challenge JS can run.
+	// Minimal browser stubs so the challenge JS can run. Elements expose the
+	// page's text, which some challenges read part of the arithmetic from, and
+	// keep what the script writes to them.
+	noTimer := func(goja.FunctionCall) goja.Value { return vm.ToValue(0) }
+	for _, name := range []string{"setTimeout", "setInterval", "clearTimeout", "clearInterval"} {
+		_ = vm.Set(name, noTimer)
+	}
+	elements := make(map[string]map[string]any)
 	_ = vm.Set("document", map[string]any{
 		"createElement": func(tag string) map[string]any {
 			return map[string]any{
@@ -168,29 +226,25 @@ func evalV1Challenge(body, host string) (string, error) {
 			}
 		},
 		"getElementById": func(id string) map[string]any {
-			return map[string]any{"value": "", "innerHTML": "", "action": ""}
+			if el, ok := elements[id]; ok {
+				return el
+			}
+			el := map[string]any{"value": "", "innerHTML": page.text(id)}
+			elements[id] = el
+			return el
 		},
 	})
 
-	setup := fmt.Sprintf(`var t = "%s"; var a = {value: 0};`, host)
-
-	_, err := vm.RunString(setup + "\n" + script)
-	if err != nil {
+	if _, err := vm.RunString(script); err != nil {
 		return "", fmt.Errorf("goja: %w", err)
 	}
 
-	val := vm.Get("a")
-	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
-		return "", fmt.Errorf("answer variable 'a' not set")
+	answer, ok := elements["jschl-answer"]["value"]
+	if !ok || answer == "" {
+		return "", fmt.Errorf("challenge did not set the answer input")
 	}
-
-	answer := val.ToObject(vm).Get("value")
-	if answer == nil || goja.IsUndefined(answer) {
-		return "", fmt.Errorf("answer variable 'a.value' not set")
-	}
-
 	// Like a browser form input, submit the value's JS string form.
-	return answer.String(), nil
+	return vm.ToValue(answer).String(), nil
 }
 
 // solveV2Challenge makes a best-effort attempt at the v2 challenge-platform
@@ -213,9 +267,10 @@ func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url
 	}
 
 	// Try form action first, fall back to challenge-platform URL.
+	page := parseChallengePage(body)
 	var submitURL string
-	if m := reV1Form.FindStringSubmatch(body); m != nil {
-		u, err := origURL.Parse(m[1])
+	if page.action != "" {
+		u, err := origURL.Parse(page.action)
 		if err == nil {
 			submitURL = u.String()
 		}
@@ -226,8 +281,8 @@ func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url
 	}
 
 	params := url.Values{}
-	if m := reV1R.FindStringSubmatch(body); m != nil {
-		params.Set("r", m[1])
+	if r := page.inputs.Get("r"); r != "" {
+		params.Set("r", r)
 	}
 	params.Set("cf_ch_verify", "plat")
 	if h, ok := fields["cHash"]; ok {
