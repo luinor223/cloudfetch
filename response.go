@@ -16,14 +16,15 @@ import (
 // Text and Bytes read the whole body, decompress it according to its
 // Content-Encoding, close it, and cache the result, so they can be called
 // more than once. Reading Body directly gives the raw, possibly compressed
-// bytes instead. For 403, 429 and 503 responses Client has already read the
-// body to look for a challenge, so use Text or Bytes for those.
+// bytes instead. For Cloudflare 403, 429 and 503 responses Client has already
+// read the body to look for a challenge, so use Text or Bytes for those.
 type Response struct {
 	*http.Response
 	body []byte
 }
 
-func (r *Response) decode() ([]byte, error) {
+// Bytes returns the response body as bytes, decompressing if needed.
+func (r *Response) Bytes() ([]byte, error) {
 	if r.body != nil {
 		return r.body, nil
 	}
@@ -61,14 +62,9 @@ func (r *Response) decode() ([]byte, error) {
 
 // Text returns the response body as a string, decompressing if needed.
 func (r *Response) Text() (string, error) {
-	b, err := r.decode()
+	b, err := r.Bytes()
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
-}
-
-// Bytes returns the response body as bytes, decompressing if needed.
-func (r *Response) Bytes() ([]byte, error) {
-	return r.decode()
 }

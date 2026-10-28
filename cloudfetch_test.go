@@ -27,6 +27,24 @@ func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *http
 	return c, srv
 }
 
+// stubWait replaces the challenge wait for the test; nil returns at once.
+func stubWait(t *testing.T, f func(context.Context, time.Duration) error) {
+	t.Helper()
+	if f == nil {
+		f = func(context.Context, time.Duration) error { return nil }
+	}
+	realWait := wait
+	wait = f
+	t.Cleanup(func() { wait = realWait })
+}
+
+// serveChallenge writes a Cloudflare challenge response with the given page.
+func serveChallenge(w http.ResponseWriter, status int, page string) {
+	w.Header().Set("Server", "cloudflare")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, page)
+}
+
 func hasCookie(r *http.Request, name string) bool {
 	_, err := r.Cookie(name)
 	return err == nil
@@ -136,9 +154,7 @@ func TestDo_HeaderPrecedence(t *testing.T) {
 }
 
 func TestDo_MaxRetries(t *testing.T) {
-	realWait := wait
-	wait = func(context.Context, time.Duration) error { return nil }
-	t.Cleanup(func() { wait = realWait })
+	stubWait(t, nil)
 
 	for _, retries := range []int{0, 2} {
 		t.Run(strconv.Itoa(retries), func(t *testing.T) {
@@ -148,9 +164,7 @@ func TestDo_MaxRetries(t *testing.T) {
 					submits.Add(1)
 					return
 				}
-				w.Header().Set("Server", "cloudflare")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = io.WriteString(w, iuamPage) // never accepts the answer
+				serveChallenge(w, http.StatusServiceUnavailable, iuamPage) // never accepts the answer
 			}), WithMaxRetries(retries))
 
 			if _, err := c.Get(srv.URL); !errors.Is(err, ErrChallengeFailed) {
@@ -220,9 +234,7 @@ func TestDo_UnsolvableChallenges(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Server", "cloudflare")
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = io.WriteString(w, tt.body)
+				serveChallenge(w, http.StatusForbidden, tt.body)
 			}))
 
 			if _, err := c.Get(srv.URL); !errors.Is(err, tt.want) {
@@ -234,12 +246,10 @@ func TestDo_UnsolvableChallenges(t *testing.T) {
 
 func TestDo_SolvesIUAM(t *testing.T) {
 	var slept time.Duration
-	realWait := wait
-	wait = func(_ context.Context, d time.Duration) error {
+	stubWait(t, func(_ context.Context, d time.Duration) error {
 		slept = d
 		return nil
-	}
-	t.Cleanup(func() { wait = realWait })
+	})
 
 	var form url.Values
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -251,9 +261,7 @@ func TestDo_SolvesIUAM(t *testing.T) {
 		case hasCookie(r, "cf_clearance"):
 			_, _ = io.WriteString(w, "content")
 		default:
-			w.Header().Set("Server", "cloudflare")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, iuamPage)
+			serveChallenge(w, http.StatusServiceUnavailable, iuamPage)
 		}
 	}))
 	u, err := url.Parse(srv.URL)
@@ -289,9 +297,7 @@ func TestDo_SolvesIUAM(t *testing.T) {
 }
 
 func TestDo_PostResendsBodyAfterChallenge(t *testing.T) {
-	realWait := wait
-	wait = func(context.Context, time.Duration) error { return nil }
-	t.Cleanup(func() { wait = realWait })
+	stubWait(t, nil)
 
 	var bodies []string
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -302,9 +308,7 @@ func TestDo_PostResendsBodyAfterChallenge(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		bodies = append(bodies, string(b))
 		if !hasCookie(r, "cf_clearance") {
-			w.Header().Set("Server", "cloudflare")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, iuamPage)
+			serveChallenge(w, http.StatusServiceUnavailable, iuamPage)
 		}
 	}))
 
@@ -325,19 +329,19 @@ func TestDo_CancelsChallengeWait(t *testing.T) {
 		if r.Method == http.MethodPost {
 			submitted = true
 		}
-		w.Header().Set("Server", "cloudflare")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, iuamPage) // asks for a 4s wait
+		serveChallenge(w, http.StatusServiceUnavailable, iuamPage) // asks for a 4s wait
 	}))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
-	req := httptest.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
-	req.RequestURI = ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	start := time.Now()
-	_, err := c.Do(req)
+	_, err = c.Do(req)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}

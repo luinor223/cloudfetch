@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -25,8 +26,9 @@ func newUTLSTestClient(t *testing.T, h http.Handler, enableHTTP2 bool, opts ...O
 	t.Cleanup(srv.Close)
 
 	c := New(opts...)
-	c.rootCAs = x509.NewCertPool()
-	c.rootCAs.AddCert(srv.Certificate())
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	c.httpClient.Transport.(*utlsTransport).rootCAs = roots
 	return c, srv
 }
 
@@ -150,11 +152,12 @@ func newConnectProxy(t *testing.T, wantAuth string) (*httptest.Server, *atomic.I
 
 func TestTransport_Proxy(t *testing.T) {
 	proxy, tunnels := newConnectProxy(t, "Basic dXNlcjpwYXNz") // user:pass
-	proxyURL := strings.Replace(proxy.URL, "http://", "http://user:pass@", 1)
+	proxyURL, _ := url.Parse(proxy.URL)
+	proxyURL.User = url.UserPassword("user", "pass")
 
 	c, srv := newUTLSTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok")
-	}), true, WithProxy(proxyURL))
+	}), true, WithProxy(proxyURL.String()))
 
 	for range 2 {
 		resp, err := c.Get(srv.URL)

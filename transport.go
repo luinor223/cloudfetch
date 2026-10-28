@@ -2,14 +2,14 @@ package cloudfetch
 
 import (
 	"bufio"
+	"cmp"
 	"context"
-	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,27 +19,38 @@ import (
 
 // utlsTransport dials with uTLS and dispatches to h1 or h2 based on ALPN.
 type utlsTransport struct {
-	client *Client
+	hello    utls.ClientHelloID
+	rootCAs  *x509.CertPool // nil means the system roots
+	proxy    *url.URL       // nil means a direct connection
+	proxyErr error          // reported by every dial if WithProxy was invalid
 
+	h2      http2.Transport //nolint:staticcheck
 	mu      sync.Mutex
 	h2Conns map[string]*http2.ClientConn //nolint:staticcheck
 }
 
-func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*utls.UConn, error) {
-	host, _, err := net.SplitHostPort(addr)
+// parseProxy parses a WithProxy URL.
+func parseProxy(rawURL string) (*url.URL, error) {
+	proxy, err := url.Parse(rawURL)
 	if err != nil {
-		host = addr
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
 	}
+	if proxy.Scheme != "http" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q: only http is supported", proxy.Scheme)
+	}
+	return proxy, nil
+}
 
-	conn, err := t.dial(ctx, network, addr)
+func (t *utlsTransport) dialUTLS(ctx context.Context, host, addr string) (*utls.UConn, error) {
+	conn, err := t.dial(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
 
 	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName: host,
-		RootCAs:    t.client.rootCAs,
-	}, t.client.browser.hello)
+		RootCAs:    t.rootCAs,
+	}, t.hello)
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
@@ -50,29 +61,21 @@ func (t *utlsTransport) dialUTLS(ctx context.Context, network, addr string) (*ut
 }
 
 // dial opens a TCP connection to addr, tunneling through the proxy if set.
-func (t *utlsTransport) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+func (t *utlsTransport) dial(ctx context.Context, addr string) (net.Conn, error) {
+	if t.proxyErr != nil {
+		return nil, t.proxyErr
+	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	if t.client.proxyURL == "" {
-		return dialer.DialContext(ctx, network, addr)
+	if t.proxy == nil {
+		return dialer.DialContext(ctx, "tcp", addr)
 	}
 
-	proxy, err := url.Parse(t.client.proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL: %w", err)
-	}
-	if proxy.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported proxy scheme %q: only http is supported", proxy.Scheme)
-	}
-	proxyAddr := proxy.Host
-	if proxy.Port() == "" {
-		proxyAddr = net.JoinHostPort(proxy.Hostname(), "80")
-	}
-
-	conn, err := dialer.DialContext(ctx, network, proxyAddr)
+	proxyAddr := net.JoinHostPort(t.proxy.Hostname(), cmp.Or(t.proxy.Port(), "80"))
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy: %w", err)
 	}
-	if err := connectTunnel(ctx, conn, proxy, addr); err != nil {
+	if err := connectTunnel(ctx, conn, t.proxy, addr); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -111,36 +114,8 @@ func connectTunnel(ctx context.Context, conn net.Conn, proxy *url.URL, addr stri
 	return nil
 }
 
-func (t *utlsTransport) getH2Conn(addr string, tlsConn net.Conn) (*http2.ClientConn, error) { //nolint:staticcheck
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.h2Conns == nil {
-		t.h2Conns = make(map[string]*http2.ClientConn) //nolint:staticcheck
-	}
-
-	if cc, ok := t.h2Conns[addr]; ok {
-		if cc.CanTakeNewRequest() {
-			return cc, nil
-		}
-		delete(t.h2Conns, addr)
-	}
-
-	h2t := &http2.Transport{ //nolint:staticcheck
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			return t.dialUTLS(ctx, network, addr)
-		},
-	}
-
-	cc, err := h2t.NewClientConn(tlsConn) //nolint:staticcheck
-	if err != nil {
-		return nil, err
-	}
-
-	t.h2Conns[addr] = cc
-	return cc, nil
-}
-
+// cachedH2 returns a cached HTTP/2 connection to addr that can take a new
+// request, or nil.
 func (t *utlsTransport) cachedH2(addr string) *http2.ClientConn { //nolint:staticcheck
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -148,6 +123,34 @@ func (t *utlsTransport) cachedH2(addr string) *http2.ClientConn { //nolint:stati
 		return cc
 	}
 	return nil
+}
+
+// h2Conn starts HTTP/2 on tlsConn and caches it for addr. If another request
+// cached a usable connection to addr meanwhile, it closes tlsConn and returns
+// that one instead.
+func (t *utlsTransport) h2Conn(addr string, tlsConn net.Conn) (*http2.ClientConn, error) { //nolint:staticcheck
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	old, ok := t.h2Conns[addr]
+	if ok && old.CanTakeNewRequest() {
+		tlsConn.Close()
+		return old, nil
+	}
+
+	cc, err := t.h2.NewClientConn(tlsConn) //nolint:staticcheck
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		// Let the replaced connection finish its requests, then close.
+		go old.Shutdown(context.Background()) //nolint:errcheck
+	}
+	if t.h2Conns == nil {
+		t.h2Conns = make(map[string]*http2.ClientConn) //nolint:staticcheck
+	}
+	t.h2Conns[addr] = cc
+	return cc, nil
 }
 
 // CloseIdleConnections closes cached HTTP/2 connections with no requests in
@@ -164,22 +167,20 @@ func (t *utlsTransport) CloseIdleConnections() {
 }
 
 func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	addr := req.URL.Host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
-	}
+	host := req.URL.Hostname()
+	addr := net.JoinHostPort(host, cmp.Or(req.URL.Port(), "443"))
 
 	if cc := t.cachedH2(addr); cc != nil {
 		return cc.RoundTrip(req)
 	}
 
-	tlsConn, err := t.dialUTLS(req.Context(), "tcp", addr)
+	tlsConn, err := t.dialUTLS(req.Context(), host, addr)
 	if err != nil {
 		return nil, err
 	}
 
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		cc, err := t.getH2Conn(addr, tlsConn)
+		cc, err := t.h2Conn(addr, tlsConn)
 		if err != nil {
 			tlsConn.Close()
 			return nil, fmt.Errorf("h2 client conn: %w", err)

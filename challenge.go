@@ -45,15 +45,6 @@ var wait = func(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// isChallengeStatus reports whether a status code can carry a Cloudflare challenge.
-func isChallengeStatus(code int) bool {
-	switch code {
-	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
-		return true
-	}
-	return false
-}
-
 // challengePage is the parsed markup of a challenge page.
 type challengePage struct {
 	action string                // action of the challenge form, if any
@@ -114,17 +105,22 @@ func attr(n *html.Node, key string) string {
 	return ""
 }
 
+// mayBeChallenge reports whether resp is a Cloudflare response with a status
+// that can carry a challenge, so its body is worth reading.
+func mayBeChallenge(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return strings.Contains(strings.ToLower(resp.Header.Get("Server")), "cloudflare")
+	}
+	return false
+}
+
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
 func detectChallenge(resp *http.Response, body string) challengeType {
-	server := resp.Header.Get("Server")
-	if !strings.Contains(strings.ToLower(server), "cloudflare") {
+	if !mayBeChallenge(resp) {
 		return noChallenge
 	}
-
 	sc := resp.StatusCode
-	if !isChallengeStatus(sc) {
-		return noChallenge
-	}
 
 	if strings.Contains(body, "orchestrate/managed/v1") ||
 		strings.Contains(body, "cf-turnstile") {
