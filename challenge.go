@@ -155,15 +155,17 @@ func evalV1Challenge(body, host string) (string, error) {
 	}
 
 	val := vm.Get("a")
-	if val == nil {
+	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
 		return "", fmt.Errorf("answer variable 'a' not set")
 	}
 
-	aObj := val.Export()
-	if m, ok := aObj.(map[string]any); ok {
-		return fmt.Sprintf("%.10f", m["value"]), nil
+	answer := val.ToObject(vm).Get("value")
+	if answer == nil || goja.IsUndefined(answer) {
+		return "", fmt.Errorf("answer variable 'a.value' not set")
 	}
-	return fmt.Sprintf("%v", aObj), nil
+
+	// Like a browser form input, submit the value's JS string form.
+	return answer.String(), nil
 }
 
 // solveV2Challenge solves the v2 challenge-platform challenge.
