@@ -85,4 +85,4 @@ httpClient := client.Underlying()  // *http.Client for advanced use
 
 ## License
 
-MIT
+[MIT](LICENSE)
