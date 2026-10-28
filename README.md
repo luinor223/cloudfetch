@@ -1,5 +1,11 @@
 # cloudfetch
 
+[![CI](https://github.com/luinor223/cloudfetch/actions/workflows/ci.yaml/badge.svg)](https://github.com/luinor223/cloudfetch/actions/workflows/ci.yaml)
+[![Coverage](https://raw.githubusercontent.com/luinor223/cloudfetch/badges/.badges/main/coverage.svg)](https://github.com/luinor223/cloudfetch/actions/workflows/ci.yaml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/luinor223/cloudfetch.svg)](https://pkg.go.dev/github.com/luinor223/cloudfetch)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/luinor223/cloudfetch)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Go HTTP client that bypasses Cloudflare bot detection by mimicking a real browser's TLS fingerprint.
 
 ## How it works
