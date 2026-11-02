@@ -1,9 +1,6 @@
-// Package cloudfetch provides an HTTP client that bypasses Cloudflare bot
-// detection by mimicking a real browser's TLS fingerprint and headers.
-//
-// It uses uTLS to reproduce a browser's TLS Client Hello (JA3/JA4
-// fingerprint), sends that browser's default headers, keeps a cookie jar
-// across requests, and solves Cloudflare's classic IUAM JS challenge.
+// Package cloudfetch is an HTTP client that gets past Cloudflare bot detection
+// by sending a real browser's TLS fingerprint and headers. It solves classic
+// IUAM challenges itself and hands harder ones to an optional Solver.
 package cloudfetch
 
 import (
@@ -14,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sync"
 	"time"
 )
 
@@ -31,16 +29,14 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.timeout = d }
 }
 
-// WithProxy routes connections through an HTTP proxy, given as
-// "http://[user:pass@]host:port", using CONNECT tunnels. The TLS handshake
-// with the target still happens end to end, so the fingerprint is unchanged.
+// WithProxy tunnels connections through an HTTP CONNECT proxy,
+// "http://[user:pass@]host:port". The fingerprint is unchanged.
 func WithProxy(proxyURL string) Option {
 	return func(c *Client) { c.proxyURL = proxyURL }
 }
 
-// WithHeader adds a header sent with every request. It overrides the
-// browser's default for the same header, and is overridden by headers set on
-// the request itself.
+// WithHeader adds a header to every request, over the browser's default but
+// under headers set on the request.
 func WithHeader(key, value string) Option {
 	return func(c *Client) { c.extraHeaders[key] = value }
 }
@@ -59,7 +55,11 @@ type Client struct {
 	maxRetries   int
 	proxyURL     string
 	extraHeaders map[string]string
+	solver       Solver
 	httpClient   *http.Client
+
+	mu         sync.Mutex // guards clearances and their fields
+	clearances map[string]*hostClearance
 }
 
 // New creates a new Client with the given options.
@@ -69,6 +69,7 @@ func New(opts ...Option) *Client {
 		timeout:      30 * time.Second,
 		maxRetries:   3,
 		extraHeaders: make(map[string]string),
+		clearances:   make(map[string]*hostClearance),
 	}
 	for _, o := range opts {
 		o(c)
@@ -85,16 +86,15 @@ func New(opts ...Option) *Client {
 
 // Errors returned by Client when a challenge can't be solved.
 var (
-	// ErrManagedChallenge means the site served a managed challenge
-	// (Turnstile), which needs a real browser.
+	// ErrManagedChallenge means a Managed or Interactive Challenge that needs
+	// a real browser, and no Solver got past it.
 	ErrManagedChallenge = errors.New("cloudfetch: managed challenge (Turnstile) needs a real browser")
 
-	// ErrCaptcha means the site served a CAPTCHA, which needs an external
-	// solving service.
+	// ErrCaptcha means the site served a CAPTCHA.
 	ErrCaptcha = errors.New("cloudfetch: CAPTCHA challenge needs an external solving service")
 
-	// ErrChallengeFailed means the site still served a JS challenge after the
-	// number of attempts set by WithMaxRetries.
+	// ErrChallengeFailed means a JS challenge wasn't solved within
+	// WithMaxRetries attempts or by the Solver.
 	ErrChallengeFailed = errors.New("cloudfetch: challenge not solved")
 )
 
@@ -117,19 +117,16 @@ func (c *Client) Post(url, contentType string, body io.Reader) (*Response, error
 	return c.Do(req)
 }
 
-// Do sends req and returns the response, solving Cloudflare challenges along
-// the way. It fills in the headers req doesn't set and leaves req unmodified.
-// req's context also bounds the waits before submitting challenge answers.
-//
-// If a challenge can't be solved, Do returns ErrManagedChallenge, ErrCaptcha
-// or ErrChallengeFailed. Otherwise the caller must close the response body,
-// directly or by calling Text or Bytes.
+// Do sends req, solving Cloudflare challenges on the way, and fills in headers
+// req doesn't set without modifying it. If a challenge can't be solved it
+// returns ErrManagedChallenge, ErrCaptcha or ErrChallengeFailed; otherwise the
+// caller must close the body, directly or via Text or Bytes.
 func (c *Client) Do(req *http.Request) (*Response, error) {
 	ctx := req.Context()
 
 	// Make the body replayable so it can be resent after solving a challenge.
 	getBody := req.GetBody
-	if getBody == nil && c.maxRetries > 0 && req.Body != nil && req.Body != http.NoBody {
+	if getBody == nil && (c.maxRetries > 0 || c.solver != nil) && req.Body != nil && req.Body != http.NoBody {
 		b, err := io.ReadAll(req.Body)
 		req.Body.Close()
 		if err != nil {
@@ -139,7 +136,8 @@ func (c *Client) Do(req *http.Request) (*Response, error) {
 	}
 
 	var solveErr error
-	for attempt := 0; ; attempt++ {
+	var solverTried bool
+	for jsAttempts := 0; ; {
 		r := req.Clone(ctx)
 		if getBody != nil {
 			body, err := getBody()
@@ -150,6 +148,7 @@ func (c *Client) Do(req *http.Request) (*Response, error) {
 		}
 		c.setHeaders(r)
 
+		sent := time.Now()
 		resp, err := c.httpClient.Do(r) //nolint:bodyclose // closed by Response.Bytes or the caller
 		if err != nil {
 			return nil, err
@@ -167,18 +166,33 @@ func (c *Client) Do(req *http.Request) (*Response, error) {
 		switch ct {
 		case noChallenge:
 			return wrapped, nil
-		case managedChallenge:
-			return nil, ErrManagedChallenge
 		case captchaChallenge:
 			return nil, ErrCaptcha
 		}
 
-		if attempt == c.maxRetries {
-			if solveErr != nil {
-				return nil, fmt.Errorf("%w after %d attempts: %w", ErrChallengeFailed, attempt, solveErr)
+		// Solver: managed and v2 at once, IUAM once attempts run out.
+		if c.solver != nil && !solverTried && (ct != iuamChallenge || jsAttempts >= c.maxRetries) {
+			solverTried = true
+			fail := ErrChallengeFailed
+			if ct == managedChallenge {
+				fail = ErrManagedChallenge
 			}
-			return nil, fmt.Errorf("%w after %d attempts", ErrChallengeFailed, attempt)
+			if err := c.clear(ctx, req.URL, sent, fail); err != nil {
+				return nil, err
+			}
+			continue
 		}
+		if ct == managedChallenge {
+			return nil, ErrManagedChallenge
+		}
+
+		if jsAttempts >= c.maxRetries {
+			if solveErr != nil {
+				return nil, fmt.Errorf("%w after %d attempts: %w", ErrChallengeFailed, jsAttempts, solveErr)
+			}
+			return nil, fmt.Errorf("%w after %d attempts", ErrChallengeFailed, jsAttempts)
+		}
+		jsAttempts++
 		if ct == iuamChallenge {
 			solveErr = c.solveIUAM(ctx, text, req.URL)
 		} else {
@@ -205,16 +219,20 @@ func (c *Client) Cookies(rawURL string) []*http.Cookie {
 	return c.httpClient.Jar.Cookies(u)
 }
 
-// Underlying returns the *http.Client that sends requests. It keeps the
-// browser's TLS fingerprint and the cookie jar, but requests sent through it
-// directly get none of the browser's default headers and no challenge solving.
+// Underlying returns the *http.Client behind c: fingerprint and cookie jar,
+// but no default headers or challenge solving.
 func (c *Client) Underlying() *http.Client {
 	return c.httpClient
 }
 
-// setHeaders fills in headers req doesn't set: WithHeader headers first, then
-// the browser's defaults.
+// setHeaders fills in missing headers: Solver headers, then WithHeader ones,
+// then browser defaults.
 func (c *Client) setHeaders(req *http.Request) {
+	for k, v := range c.clearanceHeader(req.URL.Hostname()) {
+		if req.Header.Get(k) == "" && len(v) > 0 {
+			req.Header.Set(k, v[0])
+		}
+	}
 	for k, v := range c.extraHeaders {
 		if req.Header.Get(k) == "" {
 			req.Header.Set(k, v)

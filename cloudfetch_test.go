@@ -124,13 +124,15 @@ func TestDo_HeaderPrecedence(t *testing.T) {
 	var got http.Header
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Clone()
-	}), WithHeader("X-Test", "client"), WithHeader("Accept-Language", "fr"))
+	}), WithHeader("X-Test", "client"), WithHeader("Accept-Language", "fr"), WithSolver(&fakeSolver{}))
 
 	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.host(req.URL.Hostname()).header = http.Header{"User-Agent": {"Mozilla/5.0 (solver)"}}
 	req.Header.Set("X-Test", "request")
+	req.Header.Set("User-Agent", "mine")
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -140,6 +142,7 @@ func TestDo_HeaderPrecedence(t *testing.T) {
 
 	checks := map[string]string{
 		"X-Test":          "request", // request beats WithHeader
+		"User-Agent":      "mine",    // request beats the Solver's headers
 		"Accept-Language": "fr",      // WithHeader beats the browser default
 		"Sec-Fetch-Mode":  "navigate",
 	}
@@ -148,7 +151,7 @@ func TestDo_HeaderPrecedence(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, v, want)
 		}
 	}
-	if len(req.Header) != 1 {
+	if len(req.Header) != 2 {
 		t.Errorf("Do modified the caller's request headers: %v", req.Header)
 	}
 }

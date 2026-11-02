@@ -30,7 +30,6 @@ var (
 	reV1Delay       = regexp.MustCompile(`},\s*(\d{4,5})\)`)
 	reCfChlOpt      = regexp.MustCompile(`(?s)window\._cf_chl_opt\s*=\s*\{([^}]+)\}`)
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
-	reBrowserCType  = regexp.MustCompile(`cType\s*:\s*['"](?:managed|interactive)['"]`)
 )
 
 // wait pauses before submitting a challenge answer, returning early with
@@ -116,6 +115,20 @@ func mayBeChallenge(resp *http.Response) bool {
 	return false
 }
 
+// chlOpt returns the fields of the page's window._cf_chl_opt, or nil if it
+// has none.
+func chlOpt(body string) map[string]string {
+	m := reCfChlOpt.FindStringSubmatch(body)
+	if m == nil {
+		return nil
+	}
+	fields := make(map[string]string)
+	for _, f := range reCfChlOptField.FindAllStringSubmatch(m[1], -1) {
+		fields[f[1]] = f[2]
+	}
+	return fields
+}
+
 // detectChallenge inspects the response to determine if it's a Cloudflare challenge.
 func detectChallenge(resp *http.Response, body string) challengeType {
 	if !mayBeChallenge(resp) {
@@ -123,9 +136,12 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 	}
 	sc := resp.StatusCode
 
+	switch chlOpt(body)["cType"] {
+	case "managed", "interactive":
+		return managedChallenge
+	}
 	if strings.Contains(body, "orchestrate/managed/v1") ||
-		strings.Contains(body, "cf-turnstile") ||
-		reBrowserCType.MatchString(body) {
+		strings.Contains(body, "cf-turnstile") {
 		return managedChallenge
 	}
 
@@ -242,18 +258,12 @@ func evalV1Challenge(body string, page *challengePage, host string) (string, err
 	return vm.ToValue(answer).String(), nil
 }
 
-// solveV2Challenge makes a best-effort attempt at the v2 challenge-platform
-// challenge by submitting its form fields. It does not run the challenge
-// script, so modern challenges usually fail.
+// solveV2Challenge submits the challenge-platform form without running its
+// script, so it usually fails.
 func (c *Client) solveV2Challenge(ctx context.Context, body string, origURL *url.URL) error {
-	optsMatch := reCfChlOpt.FindStringSubmatch(body)
-	if optsMatch == nil {
+	fields := chlOpt(body)
+	if fields == nil {
 		return fmt.Errorf("could not find cf_chl_opt")
-	}
-
-	fields := make(map[string]string)
-	for _, m := range reCfChlOptField.FindAllStringSubmatch(optsMatch[1], -1) {
-		fields[m[1]] = m[2]
 	}
 
 	cRay := fields["cRay"]

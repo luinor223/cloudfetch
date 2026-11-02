@@ -11,13 +11,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Response is an HTTP response from a Client.
-//
-// Text and Bytes read the whole body, decompress it according to its
-// Content-Encoding, close it, and cache the result, so they can be called
-// more than once. Reading Body directly gives the raw, possibly compressed
-// bytes instead. For Cloudflare 403, 429 and 503 responses Client has already
-// read the body to look for a challenge, so use Text or Bytes for those.
+// Response is an HTTP response from a Client. Text and Bytes return the
+// decompressed body and can be called repeatedly; Body is raw. Use them for
+// Cloudflare 403/429/503 responses, whose body the Client has already read.
 type Response struct {
 	*http.Response
 	body []byte
