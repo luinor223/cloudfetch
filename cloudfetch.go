@@ -75,7 +75,7 @@ func New(opts ...Option) *Client {
 		o(c)
 	}
 
-	t := &utlsTransport{hello: c.browser.hello}
+	t := &utlsTransport{hello: c.browser.hello, spec: c.browser.spec}
 	if c.proxyURL != "" {
 		t.proxy, t.proxyErr = parseProxy(c.proxyURL)
 	}

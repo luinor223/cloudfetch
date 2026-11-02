@@ -20,9 +20,10 @@ import (
 // utlsTransport dials with uTLS and dispatches to h1 or h2 based on ALPN.
 type utlsTransport struct {
 	hello    utls.ClientHelloID
-	rootCAs  *x509.CertPool // nil means the system roots
-	proxy    *url.URL       // nil means a direct connection
-	proxyErr error          // reported by every dial if WithProxy was invalid
+	spec     func() (*utls.ClientHelloSpec, error) // if set, used instead of hello's
+	rootCAs  *x509.CertPool                        // nil means the system roots
+	proxy    *url.URL                              // nil means a direct connection
+	proxyErr error                                 // reported by every dial if WithProxy was invalid
 
 	h2      http2.Transport //nolint:staticcheck
 	mu      sync.Mutex
@@ -47,10 +48,24 @@ func (t *utlsTransport) dialUTLS(ctx context.Context, host, addr string) (*utls.
 		return nil, err
 	}
 
+	id := t.hello
+	if t.spec != nil {
+		id = utls.HelloCustom
+	}
 	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName: host,
 		RootCAs:    t.rootCAs,
-	}, t.hello)
+	}, id)
+	if t.spec != nil {
+		spec, err := t.spec()
+		if err == nil {
+			err = tlsConn.ApplyPreset(spec)
+		}
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("utls preset: %w", err)
+		}
+	}
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()

@@ -12,7 +12,7 @@ Go HTTP client that bypasses Cloudflare bot detection by mimicking a real browse
 
 Cloudflare identifies bots partly by their TLS Client Hello fingerprint (JA3/JA4). Go's default `net/http` has a distinctive fingerprint that gets blocked. `cloudfetch` uses [uTLS](https://github.com/refraction-networking/utls) to reproduce a real browser's TLS handshake, sends that browser's headers, and keeps a cookie jar.
 
-- **TLS fingerprint** — Chrome 133, Firefox 120, Safari 16 or Edge 85 via uTLS
+- **TLS fingerprint** — Chrome 156, Firefox 120, Safari 16 or Edge 85 via uTLS
 - **Matching headers** — `User-Agent`, `Sec-CH-UA`, `Sec-Fetch-*`, etc. for the same browser and version as the TLS fingerprint
 - **JS challenge solver** — solves the classic IUAM ("Checking your browser") challenge using [goja](https://github.com/dop251/goja) (pure Go JS interpreter)
 - **Auto-retry** — detects challenge pages and retries after solving (up to 3 attempts)
