@@ -40,3 +40,19 @@ jobs:
           config: .testcoverage.yml
           git-token: ${{ github.ref_name == 'main' && secrets.GITHUB_TOKEN || '' }}
           git-branch: badges
+
+  chromesolver:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chromesolver
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: chromesolver/go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12
+          working-directory: chromesolver
+      - run: go test -race -count=1 ./...

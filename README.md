@@ -20,12 +20,14 @@ Cloudflare identifies bots partly by their TLS Client Hello fingerprint (JA3/JA4
 - **Compression** — transparent brotli/gzip/deflate/zstd decompression
 - **Cookie jar** — maintains cookies across requests
 - **Proxy** — HTTP CONNECT proxies, with optional basic auth
+- **Browser handoff** — optionally passes challenges it can't solve to headless Chrome once, then reuses the clearance cookie (see [Browser handoff](#browser-handoff))
 
 ### Limitations
 
 - **Header order and HTTP/2 settings** come from Go's `net/http`, not the browser. Sites that fingerprint those can still tell `cloudfetch` apart from a real browser.
-- **Newer JS challenges** (`challenge-platform`) are detected, but the solver only submits the page's form fields without running its script, so they usually fail.
-- **Turnstile (managed challenges) and CAPTCHAs** need a real browser; no HTTP-only client can solve them.
+- **Newer JS challenges** (`challenge-platform`) are detected, but without a solver `cloudfetch` only submits the page's form fields without running its script, so they usually fail.
+- **Managed and Interactive Challenges (Turnstile)** need a real browser. Without a solver, `cloudfetch` returns `ErrManagedChallenge`; with `chromesolver`, Chrome passes them, clicking the checkbox when asked.
+- **CAPTCHAs** (hCaptcha, reCAPTCHA) aren't solved.
 
 ## Install
 
@@ -97,12 +99,37 @@ client.CloseIdleConnections()
 httpClient := client.Underlying()  // raw *http.Client: fingerprint only, no headers or solving
 ```
 
+### Browser handoff
+
+Managed Challenges and newer JS challenges need a real browser. Set a `Solver`
+and `cloudfetch` hands those pages to it (and classic IUAM pages once its own
+attempts fail) once per request. It stores the cookies it gets (including `cf_clearance`), and
+sends the browser's identity headers (`User-Agent`, `Sec-CH-UA*`) to that host
+from then on, so the requests match the browser that passed. The
+[`chromesolver`](chromesolver) module does this with headless Chrome. It's a
+separate module so the core library doesn't pull in chromedp; installing it
+also installs `cloudfetch`:
+
+```bash
+go get github.com/luinor223/cloudfetch/chromesolver
+```
+
+```go
+client := cloudfetch.New(cloudfetch.WithSolver(chromesolver.New()))
+resp, err := client.Get(url)  // first request starts Chrome (~6s), later ones don't
+```
+
+It needs Chrome or Chromium installed. Cloudflare ties `cf_clearance` to the IP
+address and User-Agent, so if you use a proxy, give Chrome the same one with
+`chromesolver.WithAllocatorOptions(chromedp.ProxyServer(...))`. When the cookie
+expires, the next challenge runs the solver again.
+
 ### Errors
 
 ```go
 resp, err := client.Get(url)
 switch {
-case errors.Is(err, cloudfetch.ErrManagedChallenge): // Turnstile: needs a real browser
+case errors.Is(err, cloudfetch.ErrManagedChallenge): // Turnstile: needs a real browser (see WithSolver)
 case errors.Is(err, cloudfetch.ErrCaptcha):          // CAPTCHA
 case errors.Is(err, cloudfetch.ErrChallengeFailed):  // JS challenge not solved after retries
 }
