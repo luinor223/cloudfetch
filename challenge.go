@@ -30,6 +30,7 @@ var (
 	reV1Delay       = regexp.MustCompile(`},\s*(\d{4,5})\)`)
 	reCfChlOpt      = regexp.MustCompile(`(?s)window\._cf_chl_opt\s*=\s*\{([^}]+)\}`)
 	reCfChlOptField = regexp.MustCompile(`'?(\w+)'?\s*:\s*'([^']*)'`)
+	reBrowserCType  = regexp.MustCompile(`cType\s*:\s*['"](?:managed|interactive)['"]`)
 )
 
 // wait pauses before submitting a challenge answer, returning early with
@@ -123,7 +124,8 @@ func detectChallenge(resp *http.Response, body string) challengeType {
 	sc := resp.StatusCode
 
 	if strings.Contains(body, "orchestrate/managed/v1") ||
-		strings.Contains(body, "cf-turnstile") {
+		strings.Contains(body, "cf-turnstile") ||
+		reBrowserCType.MatchString(body) {
 		return managedChallenge
 	}
 
